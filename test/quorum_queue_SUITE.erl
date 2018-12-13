@@ -230,7 +230,8 @@ declare_args(Config) ->
 
     Ch = rabbit_ct_client_helpers:open_channel(Config, Server),
     LQ = ?config(queue_name, Config),
-    declare(Ch, LQ, [{<<"x-queue-type">>, longstr, <<"quorum">>}]),
+    declare(Ch, LQ, [{<<"x-queue-type">>, longstr, <<"quorum">>},
+                     {<<"x-max-length">>, long, 2000}]),
     assert_queue_type(Server, LQ, quorum),
 
     DQ = <<"classic-declare-args-q">>,
@@ -283,11 +284,7 @@ declare_invalid_args(Config) ->
        declare(rabbit_ct_client_helpers:open_channel(Config, Server),
                LQ, [{<<"x-queue-type">>, longstr, <<"quorum">>},
                     {<<"x-message-ttl">>, long, 2000}])),
-    ?assertExit(
-       {{shutdown, {server_initiated_close, 406, _}}, _},
-       declare(rabbit_ct_client_helpers:open_channel(Config, Server),
-               LQ, [{<<"x-queue-type">>, longstr, <<"quorum">>},
-                    {<<"x-max-length">>, long, 2000}])),
+
     ?assertExit(
        {{shutdown, {server_initiated_close, 406, _}}, _},
        declare(rabbit_ct_client_helpers:open_channel(Config, Server),
