@@ -685,18 +685,24 @@ handle_info({ra_event, {Name, _} = From, _} = Evt,
                     State = State0#ch{queue_states = maps:put(Name, QState1, QueueStates)},
                     %% execute actions
                     WriterPid = State#ch.writer_pid,
-                    lists:foreach(fun ({send_credit_reply, Avail}) ->
-                                          ok = rabbit_writer:send_command(
-                                                 WriterPid,
-                                                 #'basic.credit_ok'{available =
-                                                                    Avail});
-                                      ({send_drained, {CTag, Credit}}) ->
-                                          ok = rabbit_writer:send_command(
-                                                 WriterPid,
-                                                 #'basic.credit_drained'{consumer_tag   = CTag,
-                                                                         credit_drained = Credit})
-                                  end, Actions),
-                    noreply_coalesce(confirm(MsgSeqNos, Name, State));
+                    {MXs, UC1} =
+                        lists:foldl(fun ({send_credit_reply, Avail}, Acc) ->
+                                            ok = rabbit_writer:send_command(
+                                                   WriterPid,
+                                                   #'basic.credit_ok'{available =
+                                                                          Avail}),
+                                            Acc;
+                                        ({send_drained, {CTag, Credit}}, Acc) ->
+                                            ok = rabbit_writer:send_command(
+                                                   WriterPid,
+                                                   #'basic.credit_drained'{consumer_tag   = CTag,
+                                                                           credit_drained = Credit}),
+                                            Acc;
+                                        ({reject, MsgSeqNo}, {MXAcc, UCAcc}) ->
+                                            {MXs, UC1} = dtree:take_one(MsgSeqNo, UCAcc),
+                                            {[MXs | MXAcc], UC1}
+                                    end, {[], UC}, Actions),
+                    noreply_coalesce(confirm(MsgSeqNos, Name, record_multiple_rejects(MXs, State#ch{unconfirmed = UC1})));
                 eol ->
                     State1 = handle_consuming_queue_down_or_eol(Name, State0),
                     State2 = handle_delivering_queue_down(Name, State1),
@@ -1106,6 +1112,15 @@ record_rejects(MXs, State = #ch{rejected = R, tx = Tx}) ->
         _    -> failed
     end,
     State#ch{rejected = [MXs | R], tx = Tx1}.
+
+record_multiple_rejects([], State) ->
+    State;
+record_multiple_rejects(MXs, State = #ch{rejected = R, tx = Tx}) ->
+    Tx1 = case Tx of
+        none -> none;
+        _    -> failed
+    end,
+    State#ch{rejected = MXs ++ R, tx = Tx1}.
 
 record_confirms([], State) ->
     State;

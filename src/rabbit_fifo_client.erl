@@ -553,14 +553,17 @@ seq_applied({Seq, MaybeAction},
                     do_resends(Last+1, Seq-1, State0)
             end,
     {Actions, State} = maybe_add_action(MaybeAction, Actions0, State1),
-    case maps:take(Seq, State#state.pending) of
-        {{undefined, _}, Pending} ->
+    case {maps:take(Seq, State#state.pending), MaybeAction} of
+        {{{undefined, _}, Pending}, reject} = C ->
+            {Corrs, [{reject, Seq} | Actions], State#state{pending = Pending,
+                                         last_applied = Seq}};
+        {{{undefined, _}, Pending}, _} = C ->
             {Corrs, Actions, State#state{pending = Pending,
                                          last_applied = Seq}};
-        {{Corr, _}, Pending} ->
+        {{{Corr, _}, Pending}, _} = C ->
             {[Corr | Corrs], Actions, State#state{pending = Pending,
                                                   last_applied = Seq}};
-        error ->
+        {error, _} = C ->
             % must have already been resent or removed for some other reason
             % still need to update last_applied or we may inadvertently resend
             % stuff later
@@ -570,6 +573,8 @@ seq_applied(_Seq, Acc) ->
     Acc.
 
 maybe_add_action(ok, Acc, State) ->
+    {Acc, State};
+maybe_add_action(reject, Acc, State) ->
     {Acc, State};
 maybe_add_action({multi, Actions}, Acc0, State0) ->
     lists:foldl(fun (Act, {Acc, State}) ->

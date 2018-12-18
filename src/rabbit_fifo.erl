@@ -30,7 +30,8 @@
          tick/2,
          overview/1,
          get_checked_out/4,
-         reject/4,
+         init_filter/1,
+         filter/5,
          %% aux
          init_aux/1,
          handle_aux/6,
@@ -248,14 +249,10 @@ update_state(Conf, State) ->
 -spec apply(ra_machine:command_meta_data(), command(),
             ra_machine:effects(), state()) ->
     {state(), ra_machine:effects(), Reply :: term()}.
-apply(#{index := RaftIdx}, {enqueue, From, Seq, RawMsg}, Effects0, State00) ->
-    case maybe_enqueue(RaftIdx, From, Seq, RawMsg, Effects0, State00) of
-        {ok, State0, Effects1} ->
-            {State, Effects, ok} = checkout(State0, Effects1),
-            {append_to_master_index(RaftIdx, State), Effects, ok};
-        {duplicate, State, Effects} ->
-            {State, Effects, ok}
-    end;
+apply(Metadata, {enqueue, _, _, _} = Cmd, Effects0, State00) ->
+    apply_enqueue(Metadata, Cmd, Effects0, State00, false);
+apply(Metadata, {force_enqueue, _, _, _} = Cmd, Effects0, State00) ->
+    apply_enqueue(Metadata, Cmd, Effects0, State00, true);
 apply(#{index := RaftIdx}, {settle, MsgIds, ConsumerId}, Effects0,
       #state{consumers = Cons0} = State) ->
     case Cons0 of
@@ -537,15 +534,30 @@ overview(#state{consumers = Cons,
       num_ready_messages => maps:size(Messages),
       num_messages => rabbit_fifo_index:size(Indexes)}.
 
-reject(_Meta, {enqueue, _, _, _}, CmdReply, State) ->
-    case {will_overflow(State), CmdReply} of
-        {true, {notify_on_consensus, Corr, Pid}} ->
-            {[{send_msg, Pid, {reject_publish, Corr, self()}, ra_event}], true};
-        {WillOverflow, _} ->
-            {[], WillOverflow}
+init_filter(_State) ->
+    #{}.
+
+filter(_Meta, {enqueue, From, Seq, RawMsg} = Enq, CmdReply, State, FilterState0) ->
+    %% If we reject, we have to check with the filter state. If the From
+    %% is a pid we have rejected before, we should change the command to a
+    %% force enqueue. will_overflow needs to receive the filter and give
+    %% an update back
+    case {will_overflow(From, State, FilterState0), CmdReply} of
+        {{true, FilterState}, {notify_on_consensus, Corr, Pid}} ->
+            {Enq, [{send_msg, Pid, {reject_publish, Corr, self()}, ra_event}],
+             FilterState, true};
+        {{true, FilterState}, _} ->
+                {Enq, [], FilterState, true};
+        {{false, FilterState}, _} ->
+            case maps:get(From, FilterState0, none) of
+                none ->
+                    {Enq, [], FilterState, false};
+                rejected ->
+                    {{force_enqueue, From, Seq, RawMsg}, [], FilterState, false}
+            end
     end;
-reject(_Meta, _Cmd, _ReplyType, _State) ->
-    {[], false}.
+filter(_Meta, Cmd, _ReplyType, State, FilterState) ->
+    {Cmd, [], FilterState, false}.
 
 -spec get_checked_out(consumer_id(), msg_id(), msg_id(), state()) ->
     [delivery_msg()].
@@ -666,6 +678,22 @@ incr_enqueue_count(#state{enqueue_count = C,
 incr_enqueue_count(#state{enqueue_count = C} = State) ->
     {State#state{enqueue_count = C + 1}, undefined}.
 
+
+apply_enqueue(#{index := RaftIdx} = M, {_, From, Seq, RawMsg},
+              Effects0, State00, Force) ->
+    case will_overflow(From, State00, undefined) of
+        {true, _} ->
+            {filter(From, Seq, State00), Effects0, reject};
+        {false, _} ->
+            case maybe_enqueue(RaftIdx, From, Seq, RawMsg, Effects0, State00, Force) of
+                {ok, State0, Effects1} ->
+                    {State, Effects, ok} = checkout(State0, Effects1),
+                    {append_to_master_index(RaftIdx, State), Effects, ok};
+                {duplicate, State, Effects} ->
+                    {State, Effects, ok}
+            end
+    end.
+
 enqueue(RaftIdx, RawMsg, #state{messages = Messages,
                                 low_msg_num = LowMsgNum,
                                 next_msg_num = NextMsgNum} = State0) ->
@@ -693,19 +721,27 @@ enqueue_pending(From, Enq, #state{enqueuers = Enqueuers0} = State) ->
     State#state{enqueuers = Enqueuers0#{From => Enq}}.
 
 maybe_enqueue(RaftIdx, undefined, undefined, RawMsg, Effects,
-              State0) ->
+              State0, _Force) ->
     % direct enqueue without tracking
-    {ok, enqueue(RaftIdx, RawMsg, State0), Effects};
+    State = enqueue(RaftIdx, RawMsg, State0),
+    {ok, State, Effects};
 maybe_enqueue(RaftIdx, From, MsgSeqNo, RawMsg, Effects0,
-              #state{enqueuers = Enqueuers0} = State0) ->
+              #state{enqueuers = Enqueuers0} = State0, Force) ->
     case maps:get(From, Enqueuers0, undefined) of
         undefined ->
             State1 = State0#state{enqueuers = Enqueuers0#{From => #enqueuer{}}},
             {ok, State, Effects} = maybe_enqueue(RaftIdx, From, MsgSeqNo,
-                                                 RawMsg, Effects0, State1),
+                                                 RawMsg, Effects0, State1, Force),
             {ok, State, [{monitor, process, From} | Effects]};
         #enqueuer{next_seqno = MsgSeqNo} = Enq0 ->
             % it is the next expected seqno
+            State1 = enqueue(RaftIdx, RawMsg, State0),
+            Enq = Enq0#enqueuer{next_seqno = MsgSeqNo + 1},
+            State = enqueue_pending(From, Enq, State1),
+            {ok, State, Effects0};
+        #enqueuer{next_seqno = Next,
+                  pending = Pending0} = Enq0
+          when ((MsgSeqNo > Next) and Force) ->
             State1 = enqueue(RaftIdx, RawMsg, State0),
             Enq = Enq0#enqueuer{next_seqno = MsgSeqNo + 1},
             State = enqueue_pending(From, Enq, State1),
@@ -1089,11 +1125,34 @@ dehydrate_consumer(#consumer{checked_out = Checked0} = Con) ->
     Checked = maps:map(fun (_, _) -> '$prefix_msg' end, Checked0),
     Con#consumer{checked_out = Checked}.
 
-will_overflow(#state{max_length = undefined}) ->
-    false;
-will_overflow(#state{max_length = MaxLength,
-                     ra_indexes = Indexes}) ->
+will_overflow(_From, #state{max_length = undefined}, FilterState) ->
+    {false, FilterState};
+will_overflow(_From, State, undefined) ->
+    {will_overflow(State), undefined};
+will_overflow(From, State, FilterState) ->
+    case will_overflow(State) of
+        true ->
+            {true, maps:put(From, rejected, FilterState)};
+        false ->
+            {false, maps:remove(From, FilterState)}
+    end.
+
+will_overflow(#state{max_length = MaxLength, ra_indexes = Indexes}) ->
     rabbit_fifo_index:size(Indexes) >= MaxLength.
+
+filter(From, MsgSeqNo, #state{enqueuers = Enqueuers0} = State0) ->
+    case maps:get(From, Enqueuers0, undefined) of
+        undefined ->
+            filter(From, MsgSeqNo, State0#state{enqueuers = Enqueuers0#{From => #enqueuer{}}});
+        #enqueuer{next_seqno = MsgSeqNo} = Enq0 ->
+            Enq = Enq0#enqueuer{next_seqno = MsgSeqNo + 1},
+            State0#state{enqueuers = Enqueuers0#{From => Enq}};
+        #enqueuer{next_seqno = Next}
+          when MsgSeqNo > Next ->
+            State0;
+        #enqueuer{next_seqno = Next} when MsgSeqNo =< Next ->
+            State0
+    end.
 
 -ifdef(TEST).
 -include_lib("eunit/include/eunit.hrl").
