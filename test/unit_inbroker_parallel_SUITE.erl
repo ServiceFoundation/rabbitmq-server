@@ -41,6 +41,7 @@ groups() ->
                       max_length_reject_confirm,
                       max_length_bytes_reject_confirm,
                       max_length_drop_publish,
+                      max_length_drop_publish_requeue,
                       max_length_bytes_drop_publish],
     [
       {parallel_tests, [parallel], [
@@ -151,6 +152,7 @@ init_per_testcase(Testcase, Config) ->
 
 end_per_testcase(Testcase, Config)
   when Testcase == max_length_drop_publish; Testcase == max_length_bytes_drop_publish;
+       Testcase == max_length_drop_publish_requeue;
        Testcase == max_length_reject_confirm; Testcase == max_length_bytes_reject_confirm;
        Testcase == max_length_drop_head; Testcase == max_length_bytes_drop_head;
        Testcase == max_length_default; Testcase == max_length_bytes_default ->
@@ -1242,6 +1244,38 @@ max_length_drop_publish(Config) ->
     #'queue.declare_ok'{} = amqp_channel:call(Ch, #'queue.declare'{queue = QName, arguments = MaxLengthArgs ++ OverflowArgs ++ Args, durable = Durable}),
     %% If confirms are not enable, publishes will still be dropped in reject-publish mode.
     check_max_length_drops_publish(Config, QName, Ch, <<"1">>, <<"2">>, <<"3">>).
+
+max_length_drop_publish_requeue(Config) ->
+    {_Conn, Ch} = rabbit_ct_client_helpers:open_connection_and_channel(Config, 0),
+    Args = ?config(queue_args, Config),
+    Durable = ?config(queue_durable, Config),
+    QName = ?config(queue_name, Config),
+    MaxLengthArgs = [{<<"x-max-length">>, long, 1}],
+    OverflowArgs = [{<<"x-overflow">>, longstr, <<"reject-publish">>}],
+    #'queue.declare_ok'{} = amqp_channel:call(Ch, #'queue.declare'{queue = QName, arguments = MaxLengthArgs ++ OverflowArgs ++ Args, durable = Durable}),
+    %% If confirms are not enable, publishes will still be dropped in reject-publish mode.
+    check_max_length_requeue(Config, QName, Ch, <<"1">>, <<"2">>).
+
+check_max_length_requeue(Config, QName, Ch, Payload1, Payload2) ->
+    sync_mirrors(QName, Config),
+    #'basic.get_empty'{} = amqp_channel:call(Ch, #'basic.get'{queue = QName}),
+    %% A single message is published and consumed
+    amqp_channel:call(Ch, #'basic.publish'{routing_key = QName}, #amqp_msg{payload = Payload1}),
+    wait_for_consensus(QName, Config),
+    {#'basic.get_ok'{delivery_tag = DeliveryTag},
+     #amqp_msg{payload = Payload1}} = amqp_channel:call(Ch, #'basic.get'{queue = QName}),
+    #'basic.get_empty'{} = amqp_channel:call(Ch, #'basic.get'{queue = QName}),
+
+    %% Another message is published
+    amqp_channel:call(Ch, #'basic.publish'{routing_key = QName}, #amqp_msg{payload = Payload2}),
+    wait_for_consensus(QName, Config),
+    amqp_channel:cast(Ch, #'basic.nack'{delivery_tag = DeliveryTag,
+                                        multiple     = false,
+                                        requeue      = true}),
+    wait_for_consensus(QName, Config),
+    {#'basic.get_ok'{}, #amqp_msg{payload = Payload1}} = amqp_channel:call(Ch, #'basic.get'{queue = QName}),
+    {#'basic.get_ok'{}, #amqp_msg{payload = Payload2}} = amqp_channel:call(Ch, #'basic.get'{queue = QName}),
+    #'basic.get_empty'{} = amqp_channel:call(Ch, #'basic.get'{queue = QName}).
 
 max_length_bytes_drop_publish(Config) ->
     {_Conn, Ch} = rabbit_ct_client_helpers:open_connection_and_channel(Config, 0),
