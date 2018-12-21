@@ -121,7 +121,9 @@ all_tests() ->
      consume_redelivery_count,
      subscribe_redelivery_count,
      memory_alarm_rolls_wal,
-     queue_length_limit
+     queue_length_limit_one,
+     queue_length_limit,
+     queue_length_limit_with_nack
     ].
 
 %% -------------------------------------------------------------------
@@ -2077,9 +2079,7 @@ queue_length_limit(Config) ->
                                   {<<"x-max-length">>, long, 2}])),
 
     RaName = ra_name(QQ),
-    publish(Ch, QQ),
-    publish(Ch, QQ),
-    publish(Ch, QQ),
+    publish_many(Ch, QQ, 100),
     wait_for_messages_ready(Servers, RaName, 2),
     wait_for_messages_pending_ack(Servers, RaName, 0),
     DeliveryTag = consume(Ch, QQ, false),
@@ -2093,6 +2093,61 @@ queue_length_limit(Config) ->
     wait_for_messages_ready(Servers, RaName, 1),
     wait_for_messages_pending_ack(Servers, RaName, 0),
     publish(Ch, QQ),
+    wait_for_messages_ready(Servers, RaName, 2),
+    wait_for_messages_pending_ack(Servers, RaName, 0).
+
+queue_length_limit_one(Config) ->
+    [Server | _] = Servers = rabbit_ct_broker_helpers:get_node_configs(Config, nodename),
+
+    Ch = rabbit_ct_client_helpers:open_channel(Config, Server),
+    QQ = ?config(queue_name, Config),
+    ?assertEqual({'queue.declare_ok', QQ, 0, 0},
+                 declare(Ch, QQ, [{<<"x-queue-type">>, longstr, <<"quorum">>},
+                                  {<<"x-max-length">>, long, 1}])),
+
+    RaName = ra_name(QQ),
+    publish(Ch, QQ),
+    wait_for_messages_ready(Servers, RaName, 1),
+    wait_for_messages_pending_ack(Servers, RaName, 0),
+    DeliveryTag = consume(Ch, QQ, false),
+    wait_for_messages_ready(Servers, RaName, 0),
+    wait_for_messages_pending_ack(Servers, RaName, 1),
+    publish(Ch, QQ),
+    wait_for_messages_ready(Servers, RaName, 0),
+    wait_for_messages_pending_ack(Servers, RaName, 1),
+    amqp_channel:cast(Ch, #'basic.ack'{delivery_tag = DeliveryTag,
+                                       multiple     = false}),
+    wait_for_messages_ready(Servers, RaName, 0),
+    wait_for_messages_pending_ack(Servers, RaName, 0),
+    publish(Ch, QQ),
+    wait_for_messages_ready(Servers, RaName, 1),
+    wait_for_messages_pending_ack(Servers, RaName, 0).
+
+queue_length_limit_with_nack(Config) ->
+    [Server | _] = Servers = rabbit_ct_broker_helpers:get_node_configs(Config, nodename),
+
+    Ch = rabbit_ct_client_helpers:open_channel(Config, Server),
+    QQ = ?config(queue_name, Config),
+    ?assertEqual({'queue.declare_ok', QQ, 0, 0},
+                 declare(Ch, QQ, [{<<"x-queue-type">>, longstr, <<"quorum">>},
+                                  {<<"x-max-length">>, long, 2}])),
+
+    RaName = ra_name(QQ),
+    publish_many(Ch, QQ, 10),
+    wait_for_messages_ready(Servers, RaName, 2),
+    wait_for_messages_pending_ack(Servers, RaName, 0),
+    DeliveryTag = consume(Ch, QQ, false),
+    wait_for_messages_ready(Servers, RaName, 1),
+    wait_for_messages_pending_ack(Servers, RaName, 1),
+    publish_many(Ch, QQ, 10),
+    wait_for_messages_ready(Servers, RaName, 1),
+    wait_for_messages_pending_ack(Servers, RaName, 1),    
+    amqp_channel:cast(Ch, #'basic.nack'{delivery_tag = DeliveryTag,
+                                        multiple     = false,
+                                        requeue      = true}),
+    wait_for_messages_ready(Servers, RaName, 2),
+    wait_for_messages_pending_ack(Servers, RaName, 0),
+    publish_many(Ch, QQ, 10),
     wait_for_messages_ready(Servers, RaName, 2),
     wait_for_messages_pending_ack(Servers, RaName, 0).
 
@@ -2145,6 +2200,9 @@ filter_queues(Expected, Got) ->
     lists:filter(fun([K, _, _, _]) ->
                          lists:member(K, Keys)
                  end, Got).
+
+publish_many(Ch, Queue, Count) ->
+    [publish(Ch, Queue) || _ <- lists:seq(1, Count)].
 
 publish(Ch, Queue) ->
     ok = amqp_channel:cast(Ch,

@@ -713,9 +713,8 @@ qnode({_, Node}) ->
     Node.
 
 check_invalid_arguments(QueueName, Args) ->
-    Keys = [<<"x-expires">>, <<"x-message-ttl">>,
-            <<"x-max-length-bytes">>, <<"x-max-priority">>, <<"x-overflow">>,
-            <<"x-queue-mode">>],
+    Keys = [<<"x-expires">>, <<"x-message-ttl">>, <<"x-max-length-bytes">>,
+            <<"x-max-priority">>, <<"x-queue-mode">>],
     [case rabbit_misc:table_lookup(Args, Key) of
          undefined -> ok;
          _TypeVal   -> rabbit_misc:protocol_error(

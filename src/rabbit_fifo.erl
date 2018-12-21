@@ -547,7 +547,7 @@ filter(_Meta, {enqueue, From, Seq, RawMsg} = Enq, CmdReply, State, FilterState0)
             {Enq, [{send_msg, Pid, {reject_publish, Corr, self()}, ra_event}],
              FilterState, true};
         {{true, FilterState}, _} ->
-                {Enq, [], FilterState, true};
+            {Enq, [], FilterState, true};
         {{false, FilterState}, _} ->
             case maps:get(From, FilterState0, none) of
                 none ->
@@ -556,7 +556,7 @@ filter(_Meta, {enqueue, From, Seq, RawMsg} = Enq, CmdReply, State, FilterState0)
                     {{force_enqueue, From, Seq, RawMsg}, [], FilterState, false}
             end
     end;
-filter(_Meta, Cmd, _ReplyType, State, FilterState) ->
+filter(_Meta, Cmd, _ReplyType, _State, FilterState) ->
     {Cmd, [], FilterState, false}.
 
 -spec get_checked_out(consumer_id(), msg_id(), msg_id(), state()) ->
@@ -679,7 +679,7 @@ incr_enqueue_count(#state{enqueue_count = C} = State) ->
     {State#state{enqueue_count = C + 1}, undefined}.
 
 
-apply_enqueue(#{index := RaftIdx} = M, {_, From, Seq, RawMsg},
+apply_enqueue(#{index := RaftIdx}, {_, From, Seq, RawMsg},
               Effects0, State00, Force) ->
     case will_overflow(From, State00, undefined) of
         {true, _} ->
@@ -1137,8 +1137,8 @@ will_overflow(From, State, FilterState) ->
             {false, maps:remove(From, FilterState)}
     end.
 
-will_overflow(#state{max_length = MaxLength, ra_indexes = Indexes}) ->
-    rabbit_fifo_index:size(Indexes) >= MaxLength.
+will_overflow(#state{max_length = MaxLength, ra_indexes = Indexes} = State) ->
+    (rabbit_fifo_index:size(Indexes) - num_checked_out(State)) >= MaxLength.
 
 filter(From, MsgSeqNo, #state{enqueuers = Enqueuers0} = State0) ->
     case maps:get(From, Enqueuers0, undefined) of
