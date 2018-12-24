@@ -239,7 +239,8 @@
          msg_bytes_enqueue = 0 :: non_neg_integer(),
          msg_bytes_checkout = 0 :: non_neg_integer(),
          max_length :: maybe(non_neg_integer()),
-         max_bytes :: maybe(non_neg_integer())
+         max_bytes :: maybe(non_neg_integer()),
+         overflow :: 'drop-head' | 'reject-publish'
         }).
 
 -opaque state() :: #state{}.
@@ -279,11 +280,18 @@ update_config(Conf, State) ->
     SHI = maps:get(shadow_copy_interval, Conf, ?SHADOW_COPY_INTERVAL),
     MaxLength = maps:get(max_length, Conf, undefined),
     MaxBytes = maps:get(max_bytes, Conf, undefined),
+    Overflow = maps:get(overflow, Conf, undefined),
     State#state{dead_letter_handler = DLH,
                 become_leader_handler = BLH,
                 shadow_copy_interval = SHI,
                 max_length = MaxLength,
-                max_bytes = MaxBytes}.
+                max_bytes = MaxBytes,
+                overflow = init_overflow(Overflow)}.
+
+init_overflow(undefined) ->
+    'drop-head';
+init_overflow(Overflow) ->
+    binary_to_existing_atom(Overflow, utf8).
 
 zero(_) ->
     0.
@@ -603,6 +611,9 @@ overview(#state{consumers = Cons,
 init_filter(_State) ->
     #{}.
 
+
+filter(_Meta, Enq, _CmdReply, #state{overflow = 'drop-head'}, FilterState0) ->
+    {Enq, [], FilterState0, false};
 filter(_Meta, #enqueue{pid = From, seq = Seq, msg = RawMsg} = Enq, CmdReply, State, FilterState0) ->
     %% If we reject, we have to check with the filter state. If the From
     %% is a pid we have rejected before, we should change the command to a
@@ -756,20 +767,36 @@ incr_enqueue_count(#state{enqueue_count = C} = State) ->
     {State#state{enqueue_count = C + 1}, undefined}.
 
 
-apply_enqueue(#{index := RaftIdx}, From, Seq, RawMsg, Effects0, State00, Force) ->
+apply_enqueue(#{index := RaftIdx}, From, Seq, RawMsg, Effects0, State0, Force) ->
     Bytes = message_size(RawMsg),
-    case will_overflow(Bytes, From, State00, undefined) of
-        {true, _} ->
-            {filter(From, Seq, State00), Effects0, reject};
-        {false, _} ->
-            case maybe_enqueue(RaftIdx, From, Seq, RawMsg, Effects0, State00, Force) of
-                {ok, State0, Effects1} ->
-                    {State, Effects, ok} = checkout(add_bytes_enqueue(Bytes, State0),
-                                                    Effects1),
+    case {will_overflow(Bytes, From, State0, undefined), State0#state.overflow} of
+        {{true, _}, 'reject-publish'} ->
+            {filter(From, Seq, State0), Effects0, reject};
+        {{WillOverflow, _}, _} ->
+            {State1, Effects1, ok} = case WillOverflow of
+                                         true -> drop_head(RaftIdx, State0);
+                                         false -> {State0, Effects0, ok}
+                                     end,
+            case maybe_enqueue(RaftIdx, From, Seq, RawMsg, Effects1, State1, Force) of
+                {ok, State2, Effects2} ->
+                    {State, Effects, ok} = checkout(add_bytes_enqueue(Bytes, State2),
+                                                    Effects2),
                     {append_to_master_index(RaftIdx, State), Effects, ok};
                 {duplicate, State, Effects} ->
                     {State, Effects, ok}
             end
+    end.
+
+drop_head(RaftIdx, #state{ra_indexes = Indexes} = State) ->
+    %% Delete bytes
+    case take_next_msg(State) of
+        {ConsumerMsg, State0, Messages} ->
+            update_smallest_raft_index(
+              RaftIdx, Indexes,
+              State0#state{messages = Messages},
+              dead_letter_effects(maps:put(none, ConsumerMsg, #{}), State0, []));
+        error ->
+            {State, [], ok}
     end.
 
 enqueue(RaftIdx, RawMsg, #state{messages = Messages,
@@ -817,8 +844,7 @@ maybe_enqueue(RaftIdx, From, MsgSeqNo, RawMsg, Effects0,
             Enq = Enq0#enqueuer{next_seqno = MsgSeqNo + 1},
             State = enqueue_pending(From, Enq, State1),
             {ok, State, Effects0};
-        #enqueuer{next_seqno = Next,
-                  pending = Pending0} = Enq0
+        #enqueuer{next_seqno = Next} = Enq0
           when ((MsgSeqNo > Next) and Force) ->
             State1 = enqueue(RaftIdx, RawMsg, State0),
             Enq = Enq0#enqueuer{next_seqno = MsgSeqNo + 1},
@@ -1109,7 +1135,6 @@ checkout_one(#state{service_queue = SQ0,
                 _ -> {inactive, InitState}
             end
     end.
-
 
 update_or_remove_sub(ConsumerId, #consumer{lifetime = auto,
                                            credit = 0} = Con,

@@ -245,6 +245,7 @@ declare_args(Config) ->
     LQ = ?config(queue_name, Config),
     declare(Ch, LQ, [{<<"x-queue-type">>, longstr, <<"quorum">>},
                      {<<"x-max-length">>, long, 2000},
+                     {<<"x-max-length-bytes">>, long, 2000},
                      {<<"x-overflow">>, longstr, <<"reject-publish">>}]),
     assert_queue_type(Server, LQ, quorum),
 
@@ -298,12 +299,6 @@ declare_invalid_args(Config) ->
        declare(rabbit_ct_client_helpers:open_channel(Config, Server),
                LQ, [{<<"x-queue-type">>, longstr, <<"quorum">>},
                     {<<"x-message-ttl">>, long, 2000}])),
-
-    ?assertExit(
-       {{shutdown, {server_initiated_close, 406, _}}, _},
-       declare(rabbit_ct_client_helpers:open_channel(Config, Server),
-               LQ, [{<<"x-queue-type">>, longstr, <<"quorum">>},
-                    {<<"x-max-length-bytes">>, long, 2000}])),
 
     ?assertExit(
        {{shutdown, {server_initiated_close, 406, _}}, _},
