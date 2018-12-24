@@ -238,7 +238,8 @@
                                         PrefixMsgs :: non_neg_integer()},
          msg_bytes_enqueue = 0 :: non_neg_integer(),
          msg_bytes_checkout = 0 :: non_neg_integer(),
-         max_length :: maybe(non_neg_integer())
+         max_length :: maybe(non_neg_integer()),
+         max_bytes :: maybe(non_neg_integer())
         }).
 
 -opaque state() :: #state{}.
@@ -248,7 +249,8 @@
                     dead_letter_handler => applied_mfa(),
                     become_leader_handler => applied_mfa(),
                     shadow_copy_interval => non_neg_integer(),
-                    max_length => non_neg_integer()}.
+                    max_length => non_neg_integer(),
+                    max_bytes => non_neg_integer()}.
 
 -export_type([protocol/0,
               delivery/0,
@@ -276,10 +278,12 @@ update_config(Conf, State) ->
     BLH = maps:get(become_leader_handler, Conf, undefined),
     SHI = maps:get(shadow_copy_interval, Conf, ?SHADOW_COPY_INTERVAL),
     MaxLength = maps:get(max_length, Conf, undefined),
+    MaxBytes = maps:get(max_bytes, Conf, undefined),
     State#state{dead_letter_handler = DLH,
                 become_leader_handler = BLH,
                 shadow_copy_interval = SHI,
-                max_length = MaxLength}.
+                max_length = MaxLength,
+                max_bytes = MaxBytes}.
 
 zero(_) ->
     0.
@@ -290,10 +294,10 @@ zero(_) ->
             ra_machine:effects(), state()) ->
     {state(), ra_machine:effects(), Reply :: term()}.
 apply(Metadata, #enqueue{pid = From, seq = Seq,
-                         msg = RawMsg} = Cmd, Effects0, State00) ->
+                         msg = RawMsg}, Effects0, State00) ->
     apply_enqueue(Metadata, From, Seq, RawMsg, Effects0, State00, false);
 apply(Metadata, #force_enqueue{pid = From, seq = Seq,
-                               msg = RawMsg} = Cmd, Effects0, State00) ->
+                               msg = RawMsg}, Effects0, State00) ->
     apply_enqueue(Metadata, From, Seq, RawMsg, Effects0, State00, true);
 apply(#{index := RaftIdx},
       #settle{msg_ids = MsgIds, consumer_id = ConsumerId}, Effects0,
@@ -604,7 +608,8 @@ filter(_Meta, #enqueue{pid = From, seq = Seq, msg = RawMsg} = Enq, CmdReply, Sta
     %% is a pid we have rejected before, we should change the command to a
     %% force enqueue. will_overflow needs to receive the filter and give
     %% an update back
-    case {will_overflow(From, State, FilterState0), CmdReply} of
+    Bytes = message_size(RawMsg),
+    case {will_overflow(Bytes, From, State, FilterState0), CmdReply} of
         {{true, FilterState}, {notify_on_consensus, Corr, Pid}} ->
             {Enq, [{send_msg, Pid, {reject_publish, Corr, self()}, ra_event}],
              FilterState, true};
@@ -752,13 +757,14 @@ incr_enqueue_count(#state{enqueue_count = C} = State) ->
 
 
 apply_enqueue(#{index := RaftIdx}, From, Seq, RawMsg, Effects0, State00, Force) ->
-    case will_overflow(From, State00, undefined) of
+    Bytes = message_size(RawMsg),
+    case will_overflow(Bytes, From, State00, undefined) of
         {true, _} ->
             {filter(From, Seq, State00), Effects0, reject};
         {false, _} ->
             case maybe_enqueue(RaftIdx, From, Seq, RawMsg, Effects0, State00, Force) of
                 {ok, State0, Effects1} ->
-                    {State, Effects, ok} = checkout(add_bytes_enqueue(RawMsg, State0),
+                    {State, Effects, ok} = checkout(add_bytes_enqueue(Bytes, State0),
                                                     Effects1),
                     {append_to_master_index(RaftIdx, State), Effects, ok};
                 {duplicate, State, Effects} ->
@@ -1200,20 +1206,24 @@ dehydrate_consumer(#consumer{checked_out = Checked0} = Con) ->
     Checked = maps:map(fun (_, _) -> '$prefix_msg' end, Checked0),
     Con#consumer{checked_out = Checked}.
 
-will_overflow(_From, #state{name = Name, max_length = undefined}, FilterState) ->
+will_overflow(_Bytes, _From, #state{max_length = undefined,
+                                    max_bytes = undefined}, FilterState) ->
     {false, FilterState};
-will_overflow(_From, State, undefined) ->
-    {will_overflow(State), undefined};
-will_overflow(From, State, FilterState) ->
-    case will_overflow(State) of
+will_overflow(Bytes, _From, State, undefined) ->
+    {will_overflow(Bytes, State), undefined};
+will_overflow(Bytes, From, State, FilterState) ->
+    case will_overflow(Bytes, State) of
         true ->
             {true, maps:put(From, rejected, FilterState)};
         false ->
             {false, maps:remove(From, FilterState)}
     end.
 
-will_overflow(#state{name = Name, max_length = MaxLength, ra_indexes = Indexes} = State) ->
-    (rabbit_fifo_index:size(Indexes) - num_checked_out(State)) >= MaxLength.
+will_overflow(Bytes, #state{max_length = MaxLength, ra_indexes = Indexes,
+                            max_bytes = MaxBytes, msg_bytes_enqueue = BytesEnq} = State) ->
+    ExpectedSize = Bytes + BytesEnq,
+    ((rabbit_fifo_index:size(Indexes) - num_checked_out(State)) >= MaxLength)
+        orelse (ExpectedSize > MaxBytes).
 
 filter(From, MsgSeqNo, #state{enqueuers = Enqueuers0} = State0) ->
     case maps:get(From, Enqueuers0, undefined) of
@@ -1265,8 +1275,7 @@ make_purge() -> #purge{}.
 make_update_config(Config) ->
     #update_config{config = Config}.
 
-add_bytes_enqueue(Msg, #state{msg_bytes_enqueue = Enqueue} = State) ->
-    Bytes = message_size(Msg),
+add_bytes_enqueue(Bytes, #state{msg_bytes_enqueue = Enqueue} = State) ->
     State#state{msg_bytes_enqueue = Enqueue + Bytes}.
 
 add_bytes_checkout(Msg, #state{msg_bytes_checkout = Checkout,
