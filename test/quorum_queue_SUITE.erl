@@ -123,8 +123,9 @@ all_tests() ->
      consume_redelivery_count,
      subscribe_redelivery_count,
      message_bytes_metrics,
-     queue_length_limit,
-     queue_length_limit_with_nack
+     queue_length_limit_drop_head,
+     queue_length_limit_reject_publish,
+     queue_length_limit_reject_publish_with_nack
     ].
 
 memory_tests() ->
@@ -2138,14 +2139,41 @@ memory_alarm_rolls_wal(Config) ->
     timer:sleep(1000),
     ok.
 
-queue_length_limit(Config) ->
+queue_length_limit_drop_head(Config) ->
     [Server | _] = Servers = rabbit_ct_broker_helpers:get_node_configs(Config, nodename),
 
     Ch = rabbit_ct_client_helpers:open_channel(Config, Server),
     QQ = ?config(queue_name, Config),
     ?assertEqual({'queue.declare_ok', QQ, 0, 0},
                  declare(Ch, QQ, [{<<"x-queue-type">>, longstr, <<"quorum">>},
-                                  {<<"x-max-length">>, long, 2}])),
+                                  {<<"x-max-length">>, long, 1},
+                                  {<<"x-overflow">>, longstr, <<"drop-head">>}])),
+
+    RaName = ra_name(QQ),
+    ok = amqp_channel:cast(Ch,
+                           #'basic.publish'{routing_key = QQ},
+                           #amqp_msg{props   = #'P_basic'{delivery_mode = 2},
+                                     payload = <<"msg1">>}),
+    ok = amqp_channel:cast(Ch,
+                           #'basic.publish'{routing_key = QQ},
+                           #amqp_msg{props   = #'P_basic'{delivery_mode = 2},
+                                     payload = <<"msg2">>}),
+    wait_for_consensus(QQ, Config),
+    wait_for_messages_ready(Servers, RaName, 1),
+    wait_for_messages_pending_ack(Servers, RaName, 0),
+    ?assertMatch({#'basic.get_ok'{}, #amqp_msg{payload = <<"msg2">>}},
+                 amqp_channel:call(Ch, #'basic.get'{queue = QQ,
+                                                    no_ack = true})).
+
+queue_length_limit_reject_publish(Config) ->
+    [Server | _] = Servers = rabbit_ct_broker_helpers:get_node_configs(Config, nodename),
+
+    Ch = rabbit_ct_client_helpers:open_channel(Config, Server),
+    QQ = ?config(queue_name, Config),
+    ?assertEqual({'queue.declare_ok', QQ, 0, 0},
+                 declare(Ch, QQ, [{<<"x-queue-type">>, longstr, <<"quorum">>},
+                                  {<<"x-max-length">>, long, 2},
+                                  {<<"x-overflow">>, longstr, <<"reject-publish">>}])),
     
     RaName = ra_name(QQ),
     publish_many(Ch, QQ, 10),
@@ -2168,14 +2196,15 @@ queue_length_limit(Config) ->
     wait_for_messages_ready(Servers, RaName, 2),
     wait_for_messages_pending_ack(Servers, RaName, 0).
 
-queue_length_limit_with_nack(Config) ->
+queue_length_limit_reject_publish_with_nack(Config) ->
     [Server | _] = Servers = rabbit_ct_broker_helpers:get_node_configs(Config, nodename),
 
     Ch = rabbit_ct_client_helpers:open_channel(Config, Server),
     QQ = ?config(queue_name, Config),
     ?assertEqual({'queue.declare_ok', QQ, 0, 0},
                  declare(Ch, QQ, [{<<"x-queue-type">>, longstr, <<"quorum">>},
-                                  {<<"x-max-length">>, long, 2}])),
+                                  {<<"x-max-length">>, long, 2},
+                                  {<<"x-overflow">>, longstr, <<"reject-publish">>}])),
 
     RaName = ra_name(QQ),
     publish_many(Ch, QQ, 10),
